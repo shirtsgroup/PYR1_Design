@@ -40,7 +40,7 @@ def find_nearest(array, value):
     else:
         return idx3+1
 
-def clust_conf(traj, per, file_name):
+def clust_conf(traj, per):
     #Compute pairwise RMSD
     distances = np.empty((traj.n_frames, traj.n_frames))
     for i in range(traj.n_frames):
@@ -67,49 +67,67 @@ def clust_conf(traj, per, file_name):
     frames_sep.append(frames_indv)
     
     #Analyze each cluster (determine centroid and plot Intercluster RMSD)
-    frames_unique, per_unique= compare_within_cluster(traj, frames_sep, per, distances[0], file_name)
+    per_unique, frames_unique, df_clust = compare_within_cluster(traj, frames_sep, per)
 
-    traj_clust = traj.slice(frames_unique)
-    traj_clust.save_pdb(f'{file_name}.pdb')
-    return traj_clust, per_unique, frames_sep
+    return frames_unique, per_unique, frames_sep, df_clust
 
-def compare_within_cluster(traj, cluster_frames, per, rmsd_all, file_name):
+def compare_within_cluster(traj, cluster_frames, per, calc_per=True):
     per_unique = np.zeros(len(cluster_frames))
     frames_unique = []
     df_clust = pd.DataFrame()
     for f, frames in enumerate(cluster_frames):
-        cluster_traj = traj.slice(frames)
-        rmsd_clust = np.empty((cluster_traj.n_frames, cluster_traj.n_frames))
-        rmsd_clust_mean = np.zeros(cluster_traj.n_frames)
-        for i in range(cluster_traj.n_frames):
-            rmsd_clust[i] = md.rmsd(cluster_traj, cluster_traj, i, atom_indices=cluster_traj.topology.select('element != H'))
-            rmsd_clust_mean[i] = np.mean(rmsd_clust[i])
-        min_index = np.argmin(rmsd_clust_mean)
-        centroid_frame = frames[min_index]
-        frames_unique.append(centroid_frame)
-        for frame in frames:
-            per_unique[f] += per[frame]
-        df = pd.DataFrame({'Cluster ID': f+1, r'RMSD ($\AA$)': rmsd_clust[min_index]*10})
-        df_clust = pd.concat([df_clust, df])
-    #Save CSV
-    df_clust.to_csv(f'{file_name}-clust-rmsd.csv')
+        if len(frames) > 1:
+            cluster_traj = traj.slice(frames)
+            rmsd_clust = np.empty((cluster_traj.n_frames, cluster_traj.n_frames))
+            rmsd_clust_mean = np.zeros(cluster_traj.n_frames)
+            for i in range(cluster_traj.n_frames):
+                rmsd_clust[i] = md.rmsd(cluster_traj, cluster_traj, i, atom_indices=cluster_traj.topology.select('element != H'))
+                rmsd_clust_mean[i] = np.mean(rmsd_clust[i])
+            min_index = np.argmin(rmsd_clust_mean)
+            centroid_frame = frames[min_index]
+            frames_unique.append(centroid_frame)
+            if calc_per:
+                for frame in frames:
+                    per_unique[f] += per[frame]
+            df = pd.DataFrame({'Cluster ID Raw': f, r'RMSD ($\AA$)': rmsd_clust[min_index]*10, 'Occupancy': per_unique[f]})
+            df_clust = pd.concat([df_clust, df])
+        elif len(frames) == 1:
+            frames_unique.append(frames[0])
+            if calc_per:
+                per_unique[f] = per[frames[0]]
+            r = [0]
+            df = pd.DataFrame({'Cluster ID Raw': f, r'RMSD ($\AA$)': r, 'Occupancy': per_unique[f]})
+            df_clust = pd.concat([df_clust, df])
     
-    #Add Comparison of Not Clustered
-    #df = pd.DataFrame({'Cluster ID': 'Not Clustered', r'RMSD ($\AA$)': rmsd_all*10})
-    #df_clust = pd.concat([df_clust, df])
+    return per_unique, frames_unique, df_clust
 
+def plot_rmsd(df, file_name):
     #Plot Comparison
     plt.figure()
-    g = sns.FacetGrid(df_clust, col="Cluster ID", col_wrap=5, xlim=(0,3))
+    g = sns.FacetGrid(df, col="Cluster ID", col_wrap=5, xlim=(0,3))
     g.map(sns.histplot, r'RMSD ($\AA$)')
     plt.savefig(f'{file_name}-clust-rmsd.png')
-    plt.close()    
-    return frames_unique, per_unique
+    plt.close()
 
-def process_confs(traj, per, file_name):
-    #Save PDB
-    traj.save_pdb(f'{file_name}.pdb')
-
+def process_confs(traj, frame_select, per, file_name, conf_or_clust):
+    #Determine if we are processing conformer or cluster ids
+    if conf_or_clust == 'conf':
+        label = 'Conformer ID'
+    else:
+        label = 'Cluster ID'
+    
+    #Get conformer list order
+    conformer_indices = np.argsort(-np.array(per))
+    conformer_list = np.zeros(len(conformer_indices))
+    for conf, i in zip(np.linspace(1, len(conformer_indices), num=len(conformer_indices), dtype=int), conformer_indices):
+        conformer_list[i] = conf
+    traj_sorted = traj.slice(frame_select[conformer_indices[0]])
+    for i in conformer_indices[1:]:
+        traj_i = traj.slice(frame_select[i])
+        traj_sorted = md.join([traj_sorted, traj_i])
+    traj = traj.slice(frame_select)
+    traj_sorted.save_pdb(f'{file_name}.pdb')
+    
     #Compute relative conformer energy
     rel_ener = get_rel_ener(per)
 
@@ -120,30 +138,29 @@ def process_confs(traj, per, file_name):
         #Compute end point distance
         atom_pairs = [[traj.topology.select(f'name {end_pts[0]}')[0], traj.topology.select(f'name {end_pts[1]}')[0]]]
         ep_dist = md.compute_distances(traj, atom_pairs)
-    
+        
     #Save CSV
-    df_clust = pd.DataFrame({'Conformer ID': np.linspace(1, len(per), num=len(per), dtype=int), 'Occupancy': per, 'Relative FE': rel_ener})
-    df_non_zero = df_clust[df_clust['Occupancy'] > 0]
-    df_non_zero['Radius of Gyration'] = rg
+    df_clust = pd.DataFrame({label: conformer_list, 'Occupancy': per, 'Relative FE': rel_ener, 'Radius of Gyration': rg})
     if end_pts != None:
         df_non_zero['Molecule Width'] = ep_dist
-    df_non_zero.to_csv(f'{file_name}.csv')
+    df_clust.to_csv(f'{file_name}.csv')
 
     labels = []
-    for i, per in enumerate(df_non_zero['Occupancy']):
+    for i, per in enumerate(df_clust['Occupancy']):
         if per > 1.5:
-            labels.append(df_non_zero['Conformer ID'].values[i])
+            labels.append(df_clust[label].values[i])
         else:
             labels.append('')
-    df_order = df_non_zero.sort_values('Occupancy', ascending=False, inplace=False)
+
+    df_order = df_clust.sort_values('Occupancy', ascending=False, inplace=False)
     plt.figure()
-    plt.pie(df_non_zero['Occupancy'], labels=labels)
+    plt.pie(df_clust['Occupancy'], labels=labels)
     plt.title(name)
     plt.savefig(f'{file_name}_pie.png')
     plt.close()
 
     plt.figure()
-    sns.barplot(df_order, x='Conformer ID', hue='Relative FE', y='Relative FE', palette='cool_r', legend=False, order=df_order['Conformer ID'])
+    sns.barplot(df_order, x=label, hue='Relative FE', y='Relative FE', palette='cool_r', legend=False, order=df_order[label])
     plt.xlabel('Cluster ID', fontsize=16)
     plt.ylabel('Relative Free Energy (kcal/mol)', fontsize=16)
     plt.xticks(fontsize=12)
@@ -152,23 +169,25 @@ def process_confs(traj, per, file_name):
     plt.close()
 
     plt.figure()
-    sns.barplot(df_non_zero, x='Conformer ID', y='Radius of Gyration')
+    sns.barplot(df_clust, x=label, y='Radius of Gyration')
     plt.ylabel(r'Radius of Gyration($\AA$)')
     plt.savefig(f'{file_name}_rg.png')
     plt.close()
 
     plt.figure()
-    sns.histplot(df_non_zero, x='Radius of Gyration')
+    sns.histplot(df_clust, x='Radius of Gyration')
     plt.xlabel(r'Radius of Gyration($\AA$)')
     plt.savefig(f'{file_name}_rg_hist.png') 
     plt.close()
     
     if end_pts != None:
         plt.figure()
-        sns.histplot(df_non_zero, x='Molecule Width')
+        sns.histplot(df_clust, x='Molecule Width')
         plt.xlabel(r'Molecule Width ($\AA$)')
         plt.savefig(f'{file_name}_mw_hist.png') 
         plt.close()
+    
+    return traj, conformer_list
 
 def get_rel_ener(per_all):
     ref_per = np.max(per_all)
@@ -209,11 +228,7 @@ name = args.n
 end_pts = args.e
 
 #Load Trajectory
-traj = mdtraj_load(File_traj, File_gro, True, True)
-
-#Cluster all conformers
-#traj_clust, per_clust, group = clust_conf(traj, np.ones(traj.n_frames), f'{name}_clust')
-#process_confs(traj_clust, per_clust, f'{name}_clust')
+traj = mdtraj_load(File_traj, File_gro, True)
 
 #Set protein offset based on missing residues
 offset = 1
@@ -246,26 +261,58 @@ for c in range(len(conf)):
 
 #Classify dihedrals into conformations
 count = np.zeros(len(conformer))
-frame_select = []
+frame_options = np.zeros((len(conformer), traj.n_frames))
 for t in range(traj.n_frames):
-    for i, conf in enumerate(conformer):
-        if (conf == dihe_peak_sampled[t,:]).all():
-            if count[i] == 0:
-                frame_select.append(t)
+    for i, conf_i in enumerate(conformer):
+        if (conf_i == dihe_peak_sampled[t,:]).all():
+            for y, x in enumerate(frame_options[i,:]):
+                if x == 0:
+                    n = y
+                    break
+            frame_options[i,n] = int(t)
             count[i] += 1
             break
 per = 100*(count/traj.n_frames)
 
+#Filter conformer definitions
+conformer_filter = np.zeros((len(per[per!=0]), len(conf[0])))
+n=0
+for i, p in enumerate(per):
+    if p != 0:
+        conformer_filter[n,:] = conformer[i,:]
+        n+=1
+
+#Reformat frames list for trajectory processing
+per = per[per!=0]
+frame_options_list = []
+for i in range(len(conformer)):
+    frames = frame_options[i,:]
+    frame_non_zero = []
+    if (frames != 0).any():
+        for f in frames:
+            if f != 0:
+                frame_non_zero.append(int(f))
+    frame_options_list.append(frame_non_zero)
+
+#Find centroid of dihedral clusters
+x, frame_select, df = compare_within_cluster(traj, frame_options_list, per, False)
+
 #Print conformer angle combinations, percent ligand is in conformation, and frame in which the ligand is in that conformation
-df = pd.DataFrame({'Conformer ID': np.linspace(1, len(per), num=len(per), dtype=int)})
+traj_confs, conformer_list = process_confs(traj, frame_select, per, f'{name}_dihe', 'conf')
+df = pd.DataFrame({'Conformer ID': conformer_list})
 for i in range(num_dihe):
-    df[f'Max for d{i+1}'] = conformer[:,i]
+    df[f'Max for d{i+1}'] = conformer_filter[:,i]
 df.to_csv(f'{name}_dihe_def.csv')
-traj_confs = traj.slice(frame_select)
-process_confs(traj_confs, per, f'{name}_dihe')
 
 #Cluster conformers
-traj_dihe_clust, per_dihe_clust, group = clust_conf(traj_confs, per, f'{name}_dihe_clust')
-df = pd.DataFrame({'Conformer ID': np.linspace(1, len(per_dihe_clust), num=len(per_dihe_clust), dtype=int), 'Grouped Confs': group})
+frames_clust, per_dihe_clust, group, df_dihe_clust = clust_conf(traj_confs, per)
+traj_dihe_clust_sorted, conformer_list = process_confs(traj_confs, frames_clust, per_dihe_clust, f'{name}_dihe_clust', 'clust')
+conf_rmsd_list = []
+conformer_list = list(conformer_list)
+for raw_id in df_dihe_clust['Cluster ID Raw']:
+    conf_rmsd_list.append(conformer_list.index(raw_id+1))
+df_dihe_clust['Cluster ID'] = conf_rmsd_list
+plot_rmsd(df_dihe_clust, f'{name}_dihe_clust')
+df = pd.DataFrame({'Conformer ID': conformer_list, 'Grouped Confs': group})
 df.to_csv(f'{name}_dihe_clust_def.csv')
-process_confs(traj_dihe_clust, per_dihe_clust, f'{name}_dihe_clust')
+
